@@ -23,6 +23,9 @@ ssl = support.import_module("ssl")
 
 PROTOCOLS = sorted(ssl._PROTOCOL_NAMES)
 HOST = support.HOST
+IS_LIBRESSL = ssl.OPENSSL_VERSION.startswith('LibreSSL')
+IS_OPENSSL_1_1 = not IS_LIBRESSL and ssl.OPENSSL_VERSION_INFO >= (1, 1, 0)
+
 
 def data_file(*name):
     return os.path.join(os.path.dirname(__file__), *name)
@@ -137,8 +140,8 @@ class BasicSocketTests(unittest.TestCase):
     def test_str_for_enums(self):
         # Make sure that the PROTOCOL_* constants have enum-like string
         # reprs.
-        proto = ssl.PROTOCOL_SSLv3
-        self.assertEqual(str(proto), '_SSLMethod.PROTOCOL_SSLv3')
+        proto = ssl.PROTOCOL_TLS
+        self.assertEqual(str(proto), '_SSLMethod.PROTOCOL_TLS')
         ctx = ssl.SSLContext(proto)
         self.assertIs(ctx.protocol, proto)
 
@@ -304,9 +307,9 @@ class BasicSocketTests(unittest.TestCase):
         self.assertGreaterEqual(status, 0)
         self.assertLessEqual(status, 15)
         # Version string as returned by {Open,Libre}SSL, the format might change
-        if "LibreSSL" in s:
-            self.assertTrue(s.startswith("LibreSSL {:d}.{:d}".format(major, minor)),
-                            (s, t))
+        if IS_LIBRESSL:
+            self.assertTrue(s.startswith("LibreSSL {:d}".format(major)),
+                            (s, t, hex(n)))
         else:
             self.assertTrue(s.startswith("OpenSSL {:d}.{:d}.{:d}".format(major, minor, fix)),
                             (s, t))
@@ -663,7 +666,8 @@ class ContextTests(unittest.TestCase):
     def test_constructor(self):
         for protocol in PROTOCOLS:
             ssl.SSLContext(protocol)
-        self.assertRaises(TypeError, ssl.SSLContext)
+        ctx = ssl.SSLContext()
+        self.assertEqual(ctx.protocol, ssl.PROTOCOL_TLS)
         self.assertRaises(ValueError, ssl.SSLContext, -1)
         self.assertRaises(ValueError, ssl.SSLContext, 42)
 
@@ -684,15 +688,15 @@ class ContextTests(unittest.TestCase):
     def test_options(self):
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLSv1)
         # OP_ALL | OP_NO_SSLv2 | OP_NO_SSLv3 is the default value
-        self.assertEqual(ssl.OP_ALL | ssl.OP_NO_SSLv2 | ssl.OP_NO_SSLv3,
-                         ctx.options)
+        default = (ssl.OP_ALL | ssl.OP_NO_SSLv2 | ssl.OP_NO_SSLv3)
+        if not IS_LIBRESSL and ssl.OPENSSL_VERSION_INFO >= (1, 1, 0):
+            default |= ssl.OP_NO_COMPRESSION
+        self.assertEqual(default, ctx.options)
         ctx.options |= ssl.OP_NO_TLSv1
-        self.assertEqual(ssl.OP_ALL | ssl.OP_NO_SSLv2 | ssl.OP_NO_SSLv3 | ssl.OP_NO_TLSv1,
-                         ctx.options)
+        self.assertEqual(default | ssl.OP_NO_TLSv1, ctx.options)
         if can_clear_options():
-            ctx.options = (ctx.options & ~ssl.OP_NO_SSLv2) | ssl.OP_NO_TLSv1
-            self.assertEqual(ssl.OP_ALL | ssl.OP_NO_TLSv1 | ssl.OP_NO_SSLv3,
-                             ctx.options)
+            ctx.options = (ctx.options & ~ssl.OP_NO_TLSv1)
+            self.assertEqual(default, ctx.options)
             ctx.options = 0
             # Ubuntu has OP_NO_SSLv3 forced on by default
             self.assertEqual(0, ctx.options & ~ssl.OP_NO_SSLv3)
@@ -1028,6 +1032,7 @@ class ContextTests(unittest.TestCase):
         self.assertRaises(TypeError, ctx.load_default_certs, 'SERVER_AUTH')
 
     @unittest.skipIf(sys.platform == "win32", "not-Windows specific")
+    @unittest.skipIf(IS_LIBRESSL, "LibreSSL doesn't support env vars")
     def test_load_default_certs_env(self):
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLSv1)
         with support.EnvironmentVarGuard() as env:
@@ -1512,6 +1517,94 @@ class NetworkedTests(unittest.TestCase):
                 ss.context = ctx2
                 self.assertIs(ss.context, ctx2)
                 self.assertIs(ss._sslobj.context, ctx2)
+
+
+class NetworkedBIOTests(unittest.TestCase):
+
+    def ssl_io_loop(self, sock, incoming, outgoing, func, *args, **kwargs):
+        # A simple IO loop. Call func(*args) depending on the error we get
+        # (WANT_READ or WANT_WRITE) move data between the socket and the BIOs.
+        timeout = kwargs.get('timeout', 10)
+        count = 0
+        while True:
+            errno = None
+            count += 1
+            try:
+                ret = func(*args)
+            except ssl.SSLError as e:
+                if e.errno not in (ssl.SSL_ERROR_WANT_READ,
+                                   ssl.SSL_ERROR_WANT_WRITE):
+                    raise
+                errno = e.errno
+            # Get any data from the outgoing BIO irrespective of any error, and
+            # send it to the socket.
+            buf = outgoing.read()
+            sock.sendall(buf)
+            # If there's no error, we're done. For WANT_READ, we need to get
+            # data from the socket and put it in the incoming BIO.
+            if errno is None:
+                break
+            elif errno == ssl.SSL_ERROR_WANT_READ:
+                buf = sock.recv(32768)
+                if buf:
+                    incoming.write(buf)
+                else:
+                    incoming.write_eof()
+        if support.verbose:
+            sys.stdout.write("Needed %d calls to complete %s().\n"
+                             % (count, func.__name__))
+        return ret
+
+    def test_handshake(self):
+        with support.transient_internet(REMOTE_HOST):
+            sock = socket.socket(socket.AF_INET)
+            sock.connect((REMOTE_HOST, 443))
+            incoming = ssl.MemoryBIO()
+            outgoing = ssl.MemoryBIO()
+            ctx = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
+            ctx.verify_mode = ssl.CERT_REQUIRED
+            ctx.load_verify_locations(REMOTE_ROOT_CERT)
+            ctx.check_hostname = True
+            sslobj = ctx.wrap_bio(incoming, outgoing, False, REMOTE_HOST)
+            self.assertIs(sslobj._sslobj.owner, sslobj)
+            self.assertIsNone(sslobj.cipher())
+            self.assertIsNotNone(sslobj.shared_ciphers())
+            self.assertRaises(ValueError, sslobj.getpeercert)
+            if 'tls-unique' in ssl.CHANNEL_BINDING_TYPES:
+                self.assertIsNone(sslobj.get_channel_binding('tls-unique'))
+            self.ssl_io_loop(sock, incoming, outgoing, sslobj.do_handshake)
+            self.assertTrue(sslobj.cipher())
+            self.assertIsNotNone(sslobj.shared_ciphers())
+            self.assertTrue(sslobj.getpeercert())
+            if 'tls-unique' in ssl.CHANNEL_BINDING_TYPES:
+                self.assertTrue(sslobj.get_channel_binding('tls-unique'))
+            try:
+                self.ssl_io_loop(sock, incoming, outgoing, sslobj.unwrap)
+            except ssl.SSLSyscallError:
+                # self-signed.pythontest.net probably shuts down the TCP
+                # connection without sending a secure shutdown message, and
+                # this is reported as SSL_ERROR_SYSCALL
+                pass
+            self.assertRaises(ssl.SSLError, sslobj.write, b'foo')
+            sock.close()
+
+    def test_read_write_data(self):
+        with support.transient_internet(REMOTE_HOST):
+            sock = socket.socket(socket.AF_INET)
+            sock.connect((REMOTE_HOST, 443))
+            incoming = ssl.MemoryBIO()
+            outgoing = ssl.MemoryBIO()
+            ctx = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
+            ctx.verify_mode = ssl.CERT_NONE
+            sslobj = ctx.wrap_bio(incoming, outgoing, False)
+            self.ssl_io_loop(sock, incoming, outgoing, sslobj.do_handshake)
+            req = b'GET / HTTP/1.0\r\n\r\n'
+            self.ssl_io_loop(sock, incoming, outgoing, sslobj.write, req)
+            buf = self.ssl_io_loop(sock, incoming, outgoing, sslobj.read, 1024)
+            self.assertEqual(buf[:5], b'HTTP/')
+            self.ssl_io_loop(sock, incoming, outgoing, sslobj.unwrap)
+            sock.close()
+
 
 try:
     import threading
@@ -2637,6 +2730,21 @@ else:
                         s.connect((HOST, server.port))
             self.assertIn("no shared cipher", str(server.conn_errors[0]))
 
+        def test_version_basic(self):
+            """
+            Basic tests for SSLSocket.version().
+            More tests are done in the test_protocol_*() methods.
+            """
+            context = ssl.SSLContext(ssl.PROTOCOL_TLSv1)
+            with ThreadedEchoServer(CERTFILE,
+                                    ssl_version=ssl.PROTOCOL_TLSv1,
+                                    chatty=False) as server:
+                with context.wrap_socket(socket.socket()) as s:
+                    self.assertIs(s.version(), None)
+                    s.connect((HOST, server.port))
+                    self.assertEqual(s.version(), 'TLSv1')
+                self.assertIs(s.version(), None)
+
         @unittest.skipUnless(ssl.HAS_ECDH, "test requires ECDH-enabled OpenSSL")
         def test_default_ecdh_curve(self):
             # Issue #21015: elliptic curve-based Diffie Hellman key exchange
@@ -2885,6 +2993,30 @@ else:
                                            sni_name='supermessage')
             self.assertEqual(cm.exception.reason, 'TLSV1_ALERT_INTERNAL_ERROR')
             self.assertIn("TypeError", stderr.getvalue())
+
+        def test_shared_ciphers(self):
+            server_context = ssl.SSLContext(ssl.PROTOCOL_TLSv1)
+            server_context.load_cert_chain(SIGNED_CERTFILE)
+            client_context = ssl.SSLContext(ssl.PROTOCOL_TLSv1)
+            client_context.verify_mode = ssl.CERT_REQUIRED
+            client_context.load_verify_locations(SIGNING_CA)
+            if ssl.OPENSSL_VERSION_INFO >= (1, 0, 2):
+                client_context.set_ciphers("AES128:AES256")
+                server_context.set_ciphers("AES256")
+                alg1 = "AES256"
+                alg2 = "AES-256"
+            else:
+                client_context.set_ciphers("AES:3DES")
+                server_context.set_ciphers("3DES")
+                alg1 = "3DES"
+                alg2 = "DES-CBC3"
+
+            stats = server_params_test(client_context, server_context)
+            ciphers = stats['server_shared_ciphers'][0]
+            self.assertGreater(len(ciphers), 0)
+            for name, tls_version, bits in ciphers:
+                if not alg1 in name.split("-") and alg2 not in name:
+                    self.fail(name)
 
         def test_read_write_after_close_raises_valuerror(self):
             context = ssl.SSLContext(ssl.PROTOCOL_SSLv23)

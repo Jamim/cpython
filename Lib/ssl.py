@@ -51,6 +51,7 @@ The following constants identify various SSL protocol variants:
 PROTOCOL_SSLv2
 PROTOCOL_SSLv3
 PROTOCOL_SSLv23
+PROTOCOL_TLS
 PROTOCOL_TLSv1
 PROTOCOL_TLSv1_1
 PROTOCOL_TLSv1_2
@@ -126,11 +127,12 @@ from _ssl import HAS_SNI, HAS_ECDH, HAS_NPN
 
 from _ssl import _OPENSSL_API_VERSION
 
-_SSLMethod = _IntEnum('_SSLMethod',
-                      {name: value for name, value in vars(_ssl).items()
-                       if name.startswith('PROTOCOL_')})
-globals().update(_SSLMethod.__members__)
+_IntEnum._convert(
+        '_SSLMethod', __name__,
+        lambda name: name.startswith('PROTOCOL_') and name != 'PROTOCOL_SSLv23',
+        source=_ssl)
 
+PROTOCOL_SSLv23 = _SSLMethod.PROTOCOL_SSLv23 = _SSLMethod.PROTOCOL_TLS
 _PROTOCOL_NAMES = {value: name for name, value in _SSLMethod.__members__.items()}
 
 try:
@@ -342,13 +344,13 @@ class SSLContext(_SSLContext):
     __slots__ = ('protocol', '__weakref__')
     _windows_cert_stores = ("CA", "ROOT")
 
-    def __new__(cls, protocol, *args, **kwargs):
+    def __new__(cls, protocol=PROTOCOL_TLS, *args, **kwargs):
         self = _SSLContext.__new__(cls, protocol)
         if protocol != _SSLv2_IF_EXISTS:
             self.set_ciphers(_DEFAULT_CIPHERS)
         return self
 
-    def __init__(self, protocol):
+    def __init__(self, protocol=PROTOCOL_TLS):
         self.protocol = protocol
 
     def wrap_socket(self, sock, server_side=False,
@@ -402,7 +404,7 @@ def create_default_context(purpose=Purpose.SERVER_AUTH, *, cafile=None,
     if not isinstance(purpose, _ASN1Object):
         raise TypeError(purpose)
 
-    context = SSLContext(PROTOCOL_SSLv23)
+    context = SSLContext(PROTOCOL_TLS)
 
     # SSLv2 considered harmful.
     context.options |= OP_NO_SSLv2
@@ -439,7 +441,7 @@ def create_default_context(purpose=Purpose.SERVER_AUTH, *, cafile=None,
         context.load_default_certs(purpose)
     return context
 
-def _create_unverified_context(protocol=PROTOCOL_SSLv23, *, cert_reqs=None,
+def _create_unverified_context(protocol=PROTOCOL_TLS, *, cert_reqs=None,
                            check_hostname=False, purpose=Purpose.SERVER_AUTH,
                            certfile=None, keyfile=None,
                            cafile=None, capath=None, cadata=None):
@@ -495,7 +497,7 @@ class SSLSocket(socket):
 
     def __init__(self, sock=None, keyfile=None, certfile=None,
                  server_side=False, cert_reqs=CERT_NONE,
-                 ssl_version=PROTOCOL_SSLv23, ca_certs=None,
+                 ssl_version=PROTOCOL_TLS, ca_certs=None,
                  do_handshake_on_connect=True,
                  family=AF_INET, type=SOCK_STREAM, proto=0, fileno=None,
                  suppress_ragged_eofs=True, npn_protocols=None, ciphers=None,
@@ -877,7 +879,7 @@ class SSLSocket(socket):
 
 def wrap_socket(sock, keyfile=None, certfile=None,
                 server_side=False, cert_reqs=CERT_NONE,
-                ssl_version=PROTOCOL_SSLv23, ca_certs=None,
+                ssl_version=PROTOCOL_TLS, ca_certs=None,
                 do_handshake_on_connect=True,
                 suppress_ragged_eofs=True,
                 ciphers=None):
@@ -924,7 +926,7 @@ def PEM_cert_to_DER_cert(pem_cert_string):
     d = pem_cert_string.strip()[len(PEM_HEADER):-len(PEM_FOOTER)]
     return base64.decodebytes(d.encode('ASCII', 'strict'))
 
-def get_server_certificate(addr, ssl_version=PROTOCOL_SSLv23, ca_certs=None):
+def get_server_certificate(addr, ssl_version=PROTOCOL_TLS, ca_certs=None):
     """Retrieve the certificate from the server at the specified address,
     and return it as a PEM-encoded string.
     If 'ca_certs' is specified, validate the server cert against it.
