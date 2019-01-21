@@ -8,6 +8,7 @@ cache: pip
 
 branches:
   only:
+    - fix/backport-support-for-openssl-1.1-from-py3.5-to-py3.4-trigger-travis-ci
     - master
     - /^\d\.\d$/
 
